@@ -672,6 +672,22 @@ class VAEHook:
 
         task_queues = [clone_task_queue(single_task_queue)
                        for _ in range(num_tiles)]
+
+        # Best-effort coarse preview, so an interrupt mid-decode can still
+        # return a correctly-shaped tensor instead of None. Decoder only
+        # (the encoder direction has no cheap equivalent); wrapped so a
+        # failure building it can never break the real decode.
+        approx = None
+        if is_decoder:
+            try:
+                import modules.sd_vae_approx as sd_vae_approx
+                from modules.processing import opt_f
+                approx = F.interpolate(
+                    sd_vae_approx.cheap_approximation(z),
+                    scale_factor=opt_f, mode='nearest').cpu()
+            except Exception:
+                approx = None
+
         # Free memory of input latent tensor
         del z
         result = None
@@ -684,12 +700,14 @@ class VAEHook:
 
         # execute the task back and forth when switch tiles so that we always
         # keep one tile on the GPU to reduce unnecessary data transfer
+        interrupted = False
         forward = True
         while True:
             group_norm_param = GroupNormParam()
             for i in range(num_tiles) if forward else reversed(range(num_tiles)):
                 if state.interrupted:
-                    return
+                    interrupted = True
+                    break
 
                 tile = tiles[i].to(device)
                 input_bbox = in_bboxes[i]
@@ -697,7 +715,8 @@ class VAEHook:
 
                 while len(task_queue) > 0:
                     if state.interrupted:
-                        return
+                        interrupted = True
+                        break
                     # DEBUG: current task
                     # print('Running task: ', task_queue[0][0], ' on tile ', i, '/', num_tiles, ' with shape ', tile.shape)
                     task = task_queue.pop(0)
@@ -718,6 +737,9 @@ class VAEHook:
                     else:
                         tile = task[1](tile)
                     pbar.update(1)
+
+                if interrupted:
+                    break
 
                 # check for NaNs in the tile.
                 # If there are NaNs, we abort the process to save user's time
@@ -740,6 +762,9 @@ class VAEHook:
                     tiles[i] = tile.cpu()
                     del tile
 
+            if interrupted:
+                break
+
             if num_completed == num_tiles:
                 break
 
@@ -752,7 +777,18 @@ class VAEHook:
 
         # Done!
         pbar.close()
-        return result.to(vae_dtype)
+
+        # Never return None. Prefer the assembled result; on an interrupt with
+        # nothing assembled fall back to the coarse preview (decoder), and
+        # failing even that to correctly-shaped zeros.
+        if result is not None:
+            return result.to(vae_dtype)
+        if approx is not None:
+            return approx.to(device=device, dtype=vae_dtype)
+        out_h = height * 8 if is_decoder else height // 8
+        out_w = width * 8 if is_decoder else width // 8
+        out_ch = self.net.conv_out.out_channels
+        return torch.zeros((N, out_ch, out_h, out_w), device=device, dtype=vae_dtype)
 
 
 class Script(scripts.Script):
