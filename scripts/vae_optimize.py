@@ -67,13 +67,13 @@ from tqdm import tqdm
 import torch
 import torch.version
 import torch.nn.functional as F
-from einops import rearrange
 import gradio as gr
 
 import modules.scripts as scripts
 import modules.devices as devices
+import modules.shared as shared
 from modules.shared import state
-from ldm.modules.diffusionmodules.model import AttnBlock, MemoryEfficientAttnBlock
+from modules.sd_hijack import model_hijack
 
 try:
     import xformers
@@ -123,78 +123,79 @@ def inplace_nonlinearity(x):
     # Test: fix for Nans
     return F.silu(x, inplace=True)
 
-# extracted from ldm.modules.diffusionmodules.model
+def _to_seq(t):
+    """(b, c, h, w) -> (b, h*w, c), the layout the attention kernels expect."""
+    b, c, h, w = t.shape
+    return t.reshape(b, c, h * w).transpose(1, 2)
+
+
+def _vanilla_attention(q, k, v, scale):
+    """Textbook scaled-dot-product attention in plain torch."""
+    w = torch.softmax((q @ k.transpose(-1, -2)) * scale, dim=-1)
+    return w @ v
 
 
 def attn_forward(self, h_):
+    """
+    Self-attention for a VAE attention block, residual-free.
+
+    store_res / pre_norm / add_res live in the task queue (see attn2task);
+    this builds only the inner attention core plus the output projection.
+    The kernel is chosen to follow whichever attention optimization webui
+    is currently using, so the VAE tracks the same backend as the rest of
+    the pipeline and flipping --opt-sdp-attention / --xformers switches it
+    too. Written against the public torch / xformers APIs; unknown methods
+    fall back to the plain math path (correct, just less memory-optimal).
+    """
+    method = getattr(model_hijack, 'optimization_method', None)
+    method = method.lower() if isinstance(method, str) else None
+
     q = self.q(h_)
     k = self.k(h_)
     v = self.v(h_)
-
-    # compute attention
     b, c, h, w = q.shape
-    q = q.reshape(b, c, h*w)
-    q = q.permute(0, 2, 1)   # b,hw,c
-    k = k.reshape(b, c, h*w)  # b,c,hw
-    w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-    w_ = w_ * (int(c)**(-0.5))
-    w_ = torch.nn.functional.softmax(w_, dim=2)
 
-    # attend to values
-    v = v.reshape(b, c, h*w)
-    w_ = w_.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
-    # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
-    h_ = torch.bmm(v, w_)
-    h_ = h_.reshape(b, c, h, w)
+    q, k, v = _to_seq(q), _to_seq(k), _to_seq(v)
 
-    h_ = self.proj_out(h_)
+    in_dtype = q.dtype
+    upcast = getattr(shared.opts, 'upcast_attn', False)
+    if upcast:
+        q, k, v = q.float(), k.float(), v.float()
 
-    return h_
+    if method == 'sdp':
+        out = F.scaled_dot_product_attention(q, k, v)
+    elif method == 'sdp-no-mem':
+        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=False):
+            out = F.scaled_dot_product_attention(q, k, v)
+    elif method == 'xformers':
+        try:
+            out = xformers.ops.memory_efficient_attention(
+                q.contiguous(), k.contiguous(), v.contiguous(), op=None)
+        except NotImplementedError:
+            out = _vanilla_attention(q, k, v, c ** -0.5)
+    else:
+        out = _vanilla_attention(q, k, v, c ** -0.5)
 
+    if upcast:
+        out = out.to(in_dtype)
 
-def xformer_attn_forward(self, h_):
-    q = self.q(h_)
-    k = self.k(h_)
-    v = self.v(h_)
-
-    # compute attention
-    B, C, H, W = q.shape
-    q, k, v = map(lambda x: rearrange(x, 'b c h w -> b (h w) c'), (q, k, v))
-
-    q, k, v = map(
-        lambda t: t.unsqueeze(3)
-        .reshape(B, t.shape[1], 1, C)
-        .permute(0, 2, 1, 3)
-        .reshape(B * 1, t.shape[1], C)
-        .contiguous(),
-        (q, k, v),
-    )
-    out = xformers.ops.memory_efficient_attention(
-        q, k, v, attn_bias=None, op=self.attention_op)
-
-    out = (
-        out.unsqueeze(0)
-        .reshape(B, 1, out.shape[1], C)
-        .permute(0, 2, 1, 3)
-        .reshape(B, out.shape[1], C)
-    )
-    out = rearrange(out, 'b (h w) c -> b c h w', b=B, h=H, w=W, c=C)
-    out = self.proj_out(out)
-    return out
+    out = out.transpose(1, 2).reshape(b, c, h, w)
+    return self.proj_out(out)
 
 
 def attn2task(task_queue, net):
-    if isinstance(net, AttnBlock):
-        task_queue.append(('store_res', lambda x: x))
-        task_queue.append(('pre_norm', net.norm))
-        task_queue.append(('attn', lambda x, net=net: attn_forward(net, x)))
-        task_queue.append(['add_res', None])
-    elif isinstance(net, MemoryEfficientAttnBlock):
-        task_queue.append(('store_res', lambda x: x))
-        task_queue.append(('pre_norm', net.norm))
-        task_queue.append(
-            ('attn', lambda x, net=net: xformer_attn_forward(net, x)))
-        task_queue.append(['add_res', None])
+    """
+    Append the four attention steps for any VAE attention block.
+
+    Duck-typed on .norm/.q/.k/.v/.proj_out (shared by the ldm and sgm
+    attention blocks) rather than gated on a concrete class, so the SDXL
+    VAE's sgm mid-attention block gets a queue too instead of being
+    silently dropped.
+    """
+    task_queue.append(('store_res', lambda x: x))
+    task_queue.append(('pre_norm', net.norm))
+    task_queue.append(('attn', lambda x, net=net: attn_forward(net, x)))
+    task_queue.append(['add_res', None])
 
 
 def resblock2task(queue, block):
