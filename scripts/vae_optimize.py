@@ -322,6 +322,12 @@ def custom_group_norm(input, num_groups, mean, var, weight=None, bias=None, eps=
     input_reshaped = input.contiguous().view(
         1, int(b * num_groups), channel_in_group, *input.size()[2:])
 
+    # The aggregated mean/var may be accumulated in a wider dtype (e.g. fp32
+    # group-norm stats applied to an fp16 tile); match the input's dtype and
+    # device so batch_norm does not raise on a mismatch.
+    mean = mean.to(input)
+    var = var.to(input)
+
     out = F.batch_norm(input_reshaped, mean, var, weight=None, bias=None,
                        training=False, momentum=0, eps=eps)
 
@@ -608,6 +614,7 @@ class VAEHook:
         @return: image
         """
         device = next(self.net.parameters()).device
+        vae_dtype = next(self.net.parameters()).dtype
         net = self.net
         tile_size = self.tile_size
         is_decoder = self.is_decoder
@@ -745,7 +752,7 @@ class VAEHook:
 
         # Done!
         pbar.close()
-        return result
+        return result.to(vae_dtype)
 
 
 class Script(scripts.Script):
