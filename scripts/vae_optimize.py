@@ -793,6 +793,10 @@ class VAEHook:
 
 class Script(scripts.Script):
 
+    def __init__(self):
+        super().__init__()
+        self.hooked = False
+
     def title(self):
         return "Tiled VAE"
 
@@ -855,10 +859,10 @@ class Script(scripts.Script):
         if not hasattr(decoder, 'original_forward'):
             setattr(decoder, 'original_forward', decoder.forward)
 
-        # undo hijack if disabled
+        # undo hijack if disabled (only if we previously hooked)
         if not enabled:
-            if isinstance(encoder.forward, VAEHook): encoder.forward = encoder.original_forward
-            if isinstance(decoder.forward, VAEHook): decoder.forward = decoder.original_forward
+            if self.hooked:
+                self.unhook(encoder, decoder)
             return
 
         if devices.get_optimal_device == torch.device('cpu'):
@@ -874,17 +878,26 @@ class Script(scripts.Script):
             encoder, encoder_tile_size, is_decoder=False, fast_decoder=fast_decoder, fast_encoder=fast_encoder, color_fix=color_fix, to_gpu=vae_to_gpu)
         decoder.forward = VAEHook(
             decoder, decoder_tile_size, is_decoder=True, fast_decoder=fast_decoder, fast_encoder=fast_encoder, color_fix=color_fix, to_gpu=vae_to_gpu)
+        self.hooked = True
 
-    def postprocess(self, p, processed, *args):
+    def unhook(self, encoder, decoder):
+        # null the hook's net reference before restoring, so the VAEHook does
+        # not keep the VAE alive, then restore the saved forward
+        if isinstance(encoder.forward, VAEHook):
+            encoder.forward.net = None
+            encoder.forward = encoder.original_forward
+        if isinstance(decoder.forward, VAEHook):
+            decoder.forward.net = None
+            decoder.forward = decoder.original_forward
+        self.hooked = False
+
+    def postprocess(self, p, processed, enabled, *args):
+        if not enabled:
+            return
         # release vram for the next run
         vae = p.sd_model.first_stage_model
         encoder = vae.encoder
         decoder = vae.decoder
-        if isinstance(encoder.forward, VAEHook): 
-            encoder.forward.net = None
-            encoder.forward = encoder.original_forward
-        if isinstance(decoder.forward, VAEHook): 
-            decoder.forward.net = None
-            decoder.forward = decoder.original_forward
+        self.unhook(encoder, decoder)
         gc.collect()
         devices.torch_gc()
