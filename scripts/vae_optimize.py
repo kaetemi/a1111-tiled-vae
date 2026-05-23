@@ -429,10 +429,21 @@ class GroupNormParam:
         sum_pixels = torch.sum(pixels)
         pixels = pixels.unsqueeze(
             1) / sum_pixels
-        var = torch.sum(
-            var * pixels, dim=0)
-        mean = torch.sum(
-            mean * pixels, dim=0)
+        # Law of total variance: Var(X) = E[Var(X|tile)] + Var(E[X|tile]).
+        # The original code computed only the first term, dropping the
+        # between-tile contribution. That biases the estimate downward
+        # whenever tile means differ — invisible on uniform latents,
+        # severe on high-contrast ones (vpred SDXL + zsnr, custom anime
+        # VAEs) where it manifests as per-tile brightness/color shifts.
+        # fp32 throughout to keep the squared deviation safe against fp16
+        # overflow; custom_group_norm casts back to the input dtype.
+        var_f = var.float()
+        mean_f = mean.float()
+        combined_mean = torch.sum(mean_f * pixels, dim=0)
+        within_var  = torch.sum(var_f * pixels, dim=0)
+        between_var = torch.sum((mean_f - combined_mean.unsqueeze(0)) ** 2 * pixels, dim=0)
+        var = within_var + between_var
+        mean = combined_mean
         return lambda x:  custom_group_norm(x, 32, mean, var, self.weight, self.bias)
 
     @staticmethod
@@ -472,7 +483,7 @@ class VAEHook:
             fast_decoder and is_decoder)
         self.color_fix = color_fix and not is_decoder
         self.to_gpu = to_gpu
-        self.pad = 11 if is_decoder else 32
+        self.pad = 22 if is_decoder else 128
 
     def __call__(self, x):
         B, C, H, W = x.shape
@@ -562,6 +573,86 @@ class VAEHook:
 
         return tile_input_bboxes, tile_output_bboxes
 
+    def _extend_out_bboxes(self, out_bboxes, h_in, w_in):
+        """
+        Expand each non-overlapping output bbox toward its existing neighbors
+        for overlap blending. Returns (ext_bboxes, blend_out).
+
+        Each output bbox extends by `blend_out` on every side that has a
+        neighbor (i.e. not at the image border), giving adjacent tiles a
+        2*blend_out wide overlap region in which their contributions are
+        blended with a linear ramp. blend_out is set from self.pad so that
+        the extended bbox always fits within the input bbox that the VAE
+        actually processed — no out-of-range crop_valid_region calls.
+
+        is_decoder=True: blend_out is in pixels (pad * 8). is_decoder=False
+        (encoder): blend_out is in latents (pad // 8). Encoder gets the
+        smaller blend because the encoder's input padding lives in pixel
+        space and only buys pad/8 latents of output context.
+        """
+        blend_in = self.pad
+        if self.is_decoder:
+            blend_out = blend_in * 8
+            out_h, out_w = h_in * 8, w_in * 8
+        else:
+            blend_out = blend_in // 8
+            out_h, out_w = h_in // 8, w_in // 8
+
+        if blend_out <= 0:
+            return out_bboxes, 0
+
+        ext_bboxes = []
+        for ob in out_bboxes:
+            ext = [
+                max(0, ob[0] - blend_out) if ob[0] > 0 else ob[0],
+                min(out_w, ob[1] + blend_out) if ob[1] < out_w else ob[1],
+                max(0, ob[2] - blend_out) if ob[2] > 0 else ob[2],
+                min(out_h, ob[3] + blend_out) if ob[3] < out_h else ob[3],
+            ]
+            ext_bboxes.append(ext)
+        return ext_bboxes, blend_out
+
+    def _make_blend_mask(self, ext_bbox, core_bbox, device, dtype):
+        """
+        Build a 2D weight mask sized to ext_bbox. Mask is 1.0 in the tile's
+        interior and ramps linearly across overlap regions so that adjacent
+        tiles' masks sum to 1.0 exactly at every pixel of the assembled output.
+
+        For a tile with right neighbor: in the 2*L-wide overlap region
+        straddling the shared boundary, this tile's mask ramps 1→0 while the
+        neighbor's mask ramps 0→1. The 2D mask is the outer product of x and
+        y 1D masks, which preserves the sum-to-1 property in 4-corner
+        overlap regions (bilinear weights sum to 1).
+        """
+        ex_w = ext_bbox[1] - ext_bbox[0]
+        ex_h = ext_bbox[3] - ext_bbox[2]
+
+        x_mask = torch.ones(ex_w, device=device, dtype=dtype)
+        left_ext = core_bbox[0] - ext_bbox[0]
+        right_ext = ext_bbox[1] - core_bbox[1]
+        idx_x = torch.arange(ex_w, device=device, dtype=dtype)
+        if left_ext > 0:
+            denom = max(2 * left_ext - 1, 1)
+            x_mask = torch.minimum(x_mask, idx_x / float(denom))
+        if right_ext > 0:
+            denom = max(2 * right_ext - 1, 1)
+            x_mask = torch.minimum(x_mask, (ex_w - 1 - idx_x) / float(denom))
+
+        y_mask = torch.ones(ex_h, device=device, dtype=dtype)
+        top_ext = core_bbox[2] - ext_bbox[2]
+        bot_ext = ext_bbox[3] - core_bbox[3]
+        idx_y = torch.arange(ex_h, device=device, dtype=dtype)
+        if top_ext > 0:
+            denom = max(2 * top_ext - 1, 1)
+            y_mask = torch.minimum(y_mask, idx_y / float(denom))
+        if bot_ext > 0:
+            denom = max(2 * bot_ext - 1, 1)
+            y_mask = torch.minimum(y_mask, (ex_h - 1 - idx_y) / float(denom))
+
+        x_mask = torch.clamp(x_mask, 0.0, 1.0)
+        y_mask = torch.clamp(y_mask, 0.0, 1.0)
+        return (y_mask.unsqueeze(1) * x_mask.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
+
     @torch.no_grad()
     def estimate_group_norm(self, z, task_queue, color_fix):
         device = z.device
@@ -629,6 +720,8 @@ class VAEHook:
             f'[Tiled VAE]: input_size: {z.shape}, tile_size: {tile_size}, padding: {self.pad}')
 
         in_bboxes, out_bboxes = self.split_tiles(height, width)
+        ext_bboxes, blend_out = self._extend_out_bboxes(out_bboxes, height, width)
+        use_blend = blend_out > 0
 
         # Prepare tiles by split the input latents
         tiles = []
@@ -691,6 +784,7 @@ class VAEHook:
         # Free memory of input latent tensor
         del z
         result = None
+        weight_accum = None
 
         # Build task queues
 
@@ -748,9 +842,22 @@ class VAEHook:
                 if len(task_queue) == 0:
                     tiles[i] = None
                     num_completed += 1
-                    if result is None:
-                        result = torch.zeros((N, tile.shape[1], height * 8 if is_decoder else height // 8, width * 8 if is_decoder else width // 8), device=device, requires_grad=False)
-                    result[:, :, out_bboxes[i][2]:out_bboxes[i][3], out_bboxes[i][0]:out_bboxes[i][1]] = crop_valid_region(tile, in_bboxes[i], out_bboxes[i], is_decoder)
+                    if use_blend:
+                        ext = ext_bboxes[i]
+                        core = out_bboxes[i]
+                        cropped = crop_valid_region(tile, in_bboxes[i], ext, is_decoder).float()
+                        mask = self._make_blend_mask(ext, core, device=cropped.device, dtype=torch.float32)
+                        if result is None:
+                            out_h = height * 8 if is_decoder else height // 8
+                            out_w = width * 8 if is_decoder else width // 8
+                            result = torch.zeros((N, cropped.shape[1], out_h, out_w), device=device, dtype=torch.float32, requires_grad=False)
+                            weight_accum = torch.zeros((1, 1, out_h, out_w), device=device, dtype=torch.float32, requires_grad=False)
+                        result[:, :, ext[2]:ext[3], ext[0]:ext[1]] += cropped * mask
+                        weight_accum[:, :, ext[2]:ext[3], ext[0]:ext[1]] += mask
+                    else:
+                        if result is None:
+                            result = torch.zeros((N, tile.shape[1], height * 8 if is_decoder else height // 8, width * 8 if is_decoder else width // 8), device=device, requires_grad=False)
+                        result[:, :, out_bboxes[i][2]:out_bboxes[i][3], out_bboxes[i][0]:out_bboxes[i][1]] = crop_valid_region(tile, in_bboxes[i], out_bboxes[i], is_decoder)
                     del tile
                 elif i == num_tiles - 1 and forward:
                     forward = False
@@ -777,6 +884,12 @@ class VAEHook:
 
         # Done!
         pbar.close()
+
+        if use_blend and result is not None and weight_accum is not None:
+            # Normalize accumulated weighted sums by accumulated weights. The
+            # clamp_min guards against zero-weight pixels (shouldn't happen
+            # with correct geometry, but cheap insurance against div-by-zero).
+            result = result / weight_accum.clamp_min(1e-6)
 
         # Never return None. Prefer the assembled result; on an interrupt with
         # nothing assembled fall back to the coarse preview (decoder), and
